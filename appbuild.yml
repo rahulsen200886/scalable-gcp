@@ -1,0 +1,138 @@
+stages:
+  - build
+  - test
+  - component_test
+  - docker_build
+  - deploy_preprod
+  - deploy_prod
+
+variables:
+  DOCKER_DRIVER: overlay2
+  FRONTEND_IMAGE: gcr.io/$GCP_PROJECT_ID/frontend
+  BACKEND_IMAGE: gcr.io/$GCP_PROJECT_ID/backend
+  KUBECONFIG: $CI_PROJECT_DIR/kubeconfig.yaml
+
+.before_script:
+  before_script:
+    # Decode and configure GCP service account
+    - echo $GCP_SERVICE_KEY | base64 -d > $CI_PROJECT_DIR/gcp-key.json
+    - gcloud auth activate-service-account --key-file=$CI_PROJECT_DIR/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud auth configure-docker gcr.io
+    - gcloud container clusters get-credentials $GKE_CLUSTER_NAME --zone $GKE_ZONE --project $GCP_PROJECT_ID
+
+# Build React Frontend
+build_frontend:
+  stage: build
+  image: node:18
+  script:
+    - cd frontend
+    - npm install
+    - npm run build
+  artifacts:
+    paths:
+      - frontend/build
+
+# Build Java Backend
+build_backend:
+  stage: build
+  image: maven:3.8-openjdk-17
+  script:
+    - cd backend
+    - mvn clean package -DskipTests
+  artifacts:
+    paths:
+      - backend/target/*.jar
+
+# Test React Frontend
+test_frontend:
+  stage: test
+  image: node:18
+  script:
+    - cd frontend
+    - npm install
+    - npm run lint
+    - npm test -- --watchAll=false
+
+# Test Java Backend
+test_backend:
+  stage: test
+  image: maven:3.8-openjdk-17
+  script:
+    - cd backend
+    - mvn test
+
+# Component Tests for Frontend
+component_test_frontend:
+  stage: component_test
+  image: node:18
+  script:
+    - cd frontend
+    - npm install
+    - npm run test:components
+  artifacts:
+    when: always
+    paths:
+      - frontend/test-results/
+    reports:
+      junit: frontend/test-results/junit.xml
+
+# Component Tests for Backend
+component_test_backend:
+  stage: component_test
+  image: maven:3.8-openjdk-17
+  script:
+    - cd backend
+    - mvn verify -Dtest=*ComponentTest
+  artifacts:
+    when: always
+    paths:
+      - backend/target/surefire-reports/
+    reports:
+      junit: backend/target/surefire-reports/*.xml
+
+# Build Docker Images and Push to Google Container Registry (GCR)
+docker_build:
+  stage: docker_build
+  image: google/cloud-sdk:latest
+  services:
+    - docker:dind
+  extends: .before_script
+  script:
+    - docker build -t $FRONTEND_IMAGE:$CI_COMMIT_SHORT_SHA frontend/
+    - docker push $FRONTEND_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker build -t $BACKEND_IMAGE:$CI_COMMIT_SHORT_SHA backend/
+    - docker push $BACKEND_IMAGE:$CI_COMMIT_SHORT_SHA
+
+# Deploy to Pre-Production (from release branches)
+deploy_preprod:
+  stage: deploy_preprod
+  image: google/cloud-sdk:latest
+  extends: .before_script
+  script:
+    - sed -i "s|<FRONTEND_IMAGE>|$FRONTEND_IMAGE:$CI_COMMIT_SHORT_SHA|g" k8s/preprod/frontend-deployment.yaml
+    - sed -i "s|<BACKEND_IMAGE>|$BACKEND_IMAGE:$CI_COMMIT_SHORT_SHA|g" k8s/preprod/backend-deployment.yaml
+    - kubectl apply -f k8s/preprod/
+  environment:
+    name: pre-production
+    url: http://preprod.your-domain.com
+  only:
+    - /^release\/.*$/  # Triggered on release branches
+
+# Deploy to Production (if preprod succeeds)
+deploy_prod:
+  stage: deploy_prod
+  image: google/cloud-sdk:latest
+  extends: .before_script
+  script:
+    - sed -i "s|<FRONTEND_IMAGE>|$FRONTEND_IMAGE:$CI_COMMIT_SHORT_SHA|g" k8s/prod/frontend-deployment.yaml
+    - sed -i "s|<BACKEND_IMAGE>|$BACKEND_IMAGE:$CI_COMMIT_SHORT_SHA|g" k8s/prod/backend-deployment.yaml
+    - kubectl apply -f k8s/prod/
+  environment:
+    name: production
+    url: http://your-production-url.com
+  only:
+    - main  # Only deploy to production from main branch
+  needs:
+    - job: deploy_preprod
+      optional: false  # Ensure production deploys only if preprod passes
